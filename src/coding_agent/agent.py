@@ -49,13 +49,19 @@ class CodingAgent:
         self._repeated_call_limit = repeated_call_limit
         self._event_handler = event_handler or (lambda _kind, _payload: None)
 
-    def run(self, task: str) -> RunResult:
+    def run(
+        self,
+        task: str,
+        *,
+        history: list[dict[str, Any]] | None = None,
+    ) -> RunResult:
         if not isinstance(task, str) or not task.strip():
             raise AgentError("任务描述不能为空。")
         conversation = Conversation(
             self._system_prompt(),
             task.strip(),
             self._max_context_chars,
+            history=history,
         )
         previous_signature: str | None = None
         repeated_count = 0
@@ -90,7 +96,10 @@ class CodingAgent:
             tool_messages: list[dict[str, Any]] = []
             for call in tool_calls:
                 call_id, name, arguments = self._parse_tool_call(call)
-                self._event_handler("tool_start", {"name": name})
+                self._event_handler(
+                    "tool_start",
+                    {"name": name, "arguments": self._event_arguments(arguments)},
+                )
                 if isinstance(arguments, str):
                     try:
                         decoded_arguments = json.loads(arguments)
@@ -197,3 +206,25 @@ class CodingAgent:
             return bool(json.loads(result).get("ok"))
         except (json.JSONDecodeError, AttributeError):
             return False
+
+    @staticmethod
+    def _event_arguments(arguments: Any) -> Any:
+        """Make tool arguments inspectable without duplicating full file contents."""
+
+        decoded = arguments
+        if isinstance(arguments, str):
+            try:
+                decoded = json.loads(arguments)
+            except json.JSONDecodeError:
+                return arguments[:1_000]
+        if not isinstance(decoded, dict):
+            return decoded
+        summary = dict(decoded)
+        content = summary.get("content")
+        if isinstance(content, str):
+            summary["content"] = f"[文件内容，共 {len(content)} 个字符]"
+        for key in ("old", "new"):
+            value = summary.get(key)
+            if isinstance(value, str) and len(value) > 500:
+                summary[key] = f"{value[:500]}\n...[事件参数截断 {len(value) - 500} 个字符]"
+        return summary

@@ -70,6 +70,55 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('"path":"1.txt"', messages[0]["content"])
         self.assertIn('"path":"2.txt"', messages[0]["content"])
 
+    def test_completed_dialogue_history_precedes_current_task(self) -> None:
+        conversation = Conversation(
+            "rules",
+            "current task",
+            8_000,
+            history=[
+                {"role": "user", "content": "previous task"},
+                {"role": "assistant", "content": "previous result"},
+                {"role": "error", "content": "must be ignored"},
+            ],
+        )
+
+        messages = conversation.messages_for_request()
+
+        self.assertEqual(
+            [(message["role"], message["content"]) for message in messages[1:]],
+            [
+                ("user", "previous task"),
+                ("assistant", "previous result"),
+                ("user", "current task"),
+            ],
+        )
+
+    def test_history_compaction_keeps_recent_complete_pair(self) -> None:
+        conversation = Conversation(
+            "rules",
+            "current",
+            8_000,
+            history=[
+                {"role": "user", "content": "old task " + "x" * 12_000},
+                {"role": "assistant", "content": "old result"},
+                {"role": "user", "content": "recent task"},
+                {"role": "assistant", "content": "recent result"},
+            ],
+        )
+
+        messages = conversation.messages_for_request()
+
+        roles_and_text = [(message["role"], message["content"]) for message in messages[1:]]
+        self.assertEqual(
+            roles_and_text,
+            [
+                ("user", "recent task"),
+                ("assistant", "recent result"),
+                ("user", "current"),
+            ],
+        )
+        self.assertIn("较早的用户对话已压缩", messages[0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()

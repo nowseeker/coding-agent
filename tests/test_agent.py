@@ -133,6 +133,53 @@ class CodingAgentTests(unittest.TestCase):
             with self.assertRaisesRegex(APIError, "缺少 id"):
                 agent.run("查看文件")
 
+    def test_completed_history_is_sent_before_current_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient([{"role": "assistant", "content": "继续完成。"}])
+            agent = CodingAgent(client, WorkspaceTools(directory))
+
+            agent.run(
+                "现在增加测试",
+                history=[
+                    {"role": "user", "content": "先创建程序"},
+                    {"role": "assistant", "content": "程序已创建"},
+                ],
+            )
+
+            request = client.requests[0]
+            self.assertEqual(
+                [(message["role"], message["content"]) for message in request[1:]],
+                [
+                    ("user", "先创建程序"),
+                    ("assistant", "程序已创建"),
+                    ("user", "现在增加测试"),
+                ],
+            )
+
+    def test_tool_event_redacts_full_write_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            events: list[tuple[str, dict[str, Any]]] = []
+            agent = CodingAgent(
+                FakeClient(
+                    [
+                        tool_call(
+                            "write",
+                            "write_file",
+                            '{"path":"large.txt","content":"generated code"}',
+                        ),
+                        {"role": "assistant", "content": "完成。"},
+                    ]
+                ),
+                WorkspaceTools(directory),
+                event_handler=lambda kind, payload: events.append((kind, payload)),
+            )
+
+            agent.run("写文件")
+
+            start = next(payload for kind, payload in events if kind == "tool_start")
+            self.assertEqual(start["arguments"]["path"], "large.txt")
+            self.assertEqual(start["arguments"]["content"], "[文件内容，共 14 个字符]")
+
 
 if __name__ == "__main__":
     unittest.main()

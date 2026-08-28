@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Coding Agent</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23273019'/%3E%3Ctext x='16' y='21' text-anchor='middle' font-size='11' font-family='sans-serif' fill='%23d8ff73'%3ECA%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <header class="brand">
+          <div class="brand-mark" aria-hidden="true">CA</div>
+          <div>
+            <strong>Coding Agent</strong>
+            <span>本地编程智能体</span>
+          </div>
+        </header>
+
+        <button class="primary-button full" id="create-project-button" type="button">
+          <span aria-hidden="true">＋</span> 创建项目
+        </button>
+
+        <section class="sidebar-section">
+          <div class="section-label">项目</div>
+          <div id="project-list" class="project-list"></div>
+        </section>
+
+        <section class="sidebar-section conversations-section">
+          <div class="section-row">
+            <div class="section-label">对话历史</div>
+            <button class="icon-button" id="new-conversation-button" type="button" title="新建对话" disabled>＋</button>
+          </div>
+          <div id="conversation-list" class="conversation-list"></div>
+        </section>
+
+        <footer class="runtime-card" id="runtime-card">
+          <span class="status-dot" id="runtime-dot"></span>
+          <div>
+            <strong id="runtime-title">读取配置中</strong>
+            <span id="runtime-detail">请稍候</span>
+          </div>
+        </footer>
+      </aside>
+
+      <main class="chat-panel">
+        <header class="chat-header">
+          <div>
+            <h1 id="chat-title">选择或创建项目</h1>
+            <p id="workspace-path">每个项目对应一个独立的本地工作区</p>
+          </div>
+          <span class="local-badge">LOCAL TOOLS</span>
+        </header>
+
+        <div class="message-list" id="message-list">
+          <section class="empty-state">
+            <div class="empty-icon" aria-hidden="true">&lt;/&gt;</div>
+            <h2>从一个真实编程任务开始</h2>
+            <p>创建项目后，智能体会读取文件、修改代码、运行命令，并把执行轨迹显示在右侧。</p>
+          </section>
+        </div>
+
+        <form class="composer" id="composer">
+          <textarea
+            id="message-input"
+            rows="3"
+            maxlength="100000"
+            placeholder="描述你希望智能体完成的任务…"
+            disabled
+          ></textarea>
+          <div class="composer-footer">
+            <span>Enter 发送 · Shift + Enter 换行</span>
+            <button class="send-button" id="send-button" type="submit" disabled aria-label="发送任务">↑</button>
+          </div>
+        </form>
+      </main>
+
+      <aside class="trace-panel">
+        <header class="trace-header">
+          <div>
+            <span class="eyebrow">AGENT LOOP</span>
+            <h2>执行轨迹</h2>
+          </div>
+          <span class="run-state idle" id="run-state">空闲</span>
+        </header>
+
+        <div class="architecture-card">
+          <div><span>1</span> 模型解析任务</div>
+          <i></i>
+          <div><span>2</span> 本地工具执行</div>
+          <i></i>
+          <div><span>3</span> 结果返回模型</div>
+        </div>
+
+        <div class="trace-list" id="trace-list">
+          <div class="trace-placeholder">工具调用、错误和循环轮次会显示在这里。</div>
+        </div>
+      </aside>
+    </div>
+
+    <dialog id="project-dialog">
+      <form method="dialog" id="project-form">
+        <div class="dialog-header">
+          <div>
+            <span class="eyebrow">NEW WORKSPACE</span>
+            <h2>创建项目</h2>
+          </div>
+          <button class="icon-button" value="cancel" type="submit" aria-label="关闭">×</button>
+        </div>
+        <label for="project-name">项目名称</label>
+        <input id="project-name" name="name" maxlength="80" autocomplete="off" placeholder="例如 random-number-demo" required />
+        <p class="field-help">项目会创建在启动参数指定的 projects-root 目录中。</p>
+        <div class="dialog-actions">
+          <button class="secondary-button" value="cancel" type="submit">取消</button>
+          <button class="primary-button" id="confirm-project-button" value="default" type="submit">创建</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
