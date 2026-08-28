@@ -49,13 +49,19 @@ class CodingAgent:
         self._repeated_call_limit = repeated_call_limit
         self._event_handler = event_handler or (lambda _kind, _payload: None)
 
-    def run(self, task: str) -> RunResult:
+    def run(
+        self,
+        task: str,
+        *,
+        history: list[dict[str, Any]] | None = None,
+    ) -> RunResult:
         if not isinstance(task, str) or not task.strip():
             raise AgentError("任务描述不能为空。")
         conversation = Conversation(
             self._system_prompt(),
             task.strip(),
             self._max_context_chars,
+            history=history,
         )
         previous_signature: str | None = None
         repeated_count = 0

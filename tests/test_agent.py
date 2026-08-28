@@ -133,6 +133,29 @@ class CodingAgentTests(unittest.TestCase):
             with self.assertRaisesRegex(APIError, "缺少 id"):
                 agent.run("查看文件")
 
+    def test_completed_history_is_sent_before_current_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient([{"role": "assistant", "content": "继续完成。"}])
+            agent = CodingAgent(client, WorkspaceTools(directory))
+
+            agent.run(
+                "现在增加测试",
+                history=[
+                    {"role": "user", "content": "先创建程序"},
+                    {"role": "assistant", "content": "程序已创建"},
+                ],
+            )
+
+            request = client.requests[0]
+            self.assertEqual(
+                [(message["role"], message["content"]) for message in request[1:]],
+                [
+                    ("user", "先创建程序"),
+                    ("assistant", "程序已创建"),
+                    ("user", "现在增加测试"),
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
