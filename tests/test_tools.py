@@ -209,6 +209,148 @@ class WorkspaceToolsTests(unittest.TestCase):
         with self.assertRaisesRegex(ToolError, "参数不一致"):
             spec.validate_contract()
 
+    def test_finish_task_requires_a_successful_local_action(self) -> None:
+        result = json.loads(
+            self.tools.execute(
+                "finish_task",
+                {"summary": "没有检查就直接完成"},
+            )
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("尚无成功", result["error"])
+        self.assertIsNone(self.tools.completion_evidence)
+
+    def test_read_only_task_can_finish_after_inspection(self) -> None:
+        self.assertTrue(json.loads(self.tools.execute("list_files", {}))["ok"])
+
+        result = json.loads(
+            self.tools.execute(
+                "finish_task",
+                {"summary": "完成项目检查"},
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIsNotNone(self.tools.completion_evidence)
+        self.assertEqual(self.tools.completion_evidence.changed_files, ())
+
+    def test_modified_task_requires_later_successful_verification(self) -> None:
+        write_result = json.loads(
+            self.tools.execute(
+                "write_file",
+                {"path": "changed.txt", "content": "changed"},
+            )
+        )
+        self.assertTrue(write_result["ok"])
+
+        missing = json.loads(
+            self.tools.execute("finish_task", {"summary": "写入文件"})
+        )
+        self.assertFalse(missing["ok"])
+        self.assertIn("必须先运行验证命令", missing["error"])
+
+        command = "python --version"
+        command_result = json.loads(
+            self.tools.execute("run_command", {"command": command})
+        )
+        self.assertTrue(command_result["ok"])
+
+        accepted = json.loads(
+            self.tools.execute(
+                "finish_task",
+                {
+                    "summary": "写入文件并完成验证",
+                    "verification_command": command,
+                },
+            )
+        )
+        self.assertTrue(accepted["ok"])
+        self.assertEqual(self.tools.completion_evidence.changed_files, ("changed.txt",))
+        self.assertEqual(self.tools.completion_evidence.verification_command, command)
+
+    def test_old_verification_cannot_cover_a_later_change(self) -> None:
+        command = "python --version"
+        self.tools.execute("write_file", {"path": "first.txt", "content": "1"})
+        self.tools.execute("run_command", {"command": command})
+        self.tools.execute("write_file", {"path": "second.txt", "content": "2"})
+
+        result = json.loads(
+            self.tools.execute(
+                "finish_task",
+                {"summary": "尝试复用旧验证", "verification_command": command},
+            )
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("不晚于最近一次文件修改", result["error"])
+
+    def test_nonzero_command_cannot_be_used_as_verification(self) -> None:
+        self.tools.execute("write_file", {"path": "changed.txt", "content": "x"})
+        failed_command = 'python -c "raise SystemExit(3)"'
+        command_result = json.loads(
+            self.tools.execute("run_command", {"command": failed_command})
+        )
+        self.assertTrue(command_result["ok"])
+        self.assertIn("exit_code: 3", command_result["output"])
+
+        result = json.loads(
+            self.tools.execute(
+                "finish_task",
+                {
+                    "summary": "错误地使用失败命令",
+                    "verification_command": failed_command,
+                },
+            )
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("退出码为 0", result["error"])
+
+    def test_run_command_file_changes_are_detected(self) -> None:
+        mutation_command = (
+            'python -c "from pathlib import Path; '
+            "Path('generated.txt').write_text('x', encoding='utf-8')\""
+        )
+        self.tools.execute("run_command", {"command": mutation_command})
+
+        same_command = json.loads(
+            self.tools.execute(
+                "finish_task",
+                {
+                    "summary": "命令生成了文件",
+                    "verification_command": mutation_command,
+                },
+            )
+        )
+        self.assertFalse(same_command["ok"])
+
+        verification_command = "python --version"
+        self.tools.execute("run_command", {"command": verification_command})
+        accepted = json.loads(
+            self.tools.execute(
+                "finish_task",
+                {
+                    "summary": "命令生成文件后另行验证",
+                    "verification_command": verification_command,
+                },
+            )
+        )
+
+        self.assertTrue(accepted["ok"])
+        self.assertIn("generated.txt", self.tools.completion_evidence.changed_files)
+
+    def test_start_task_clears_previous_completion_evidence(self) -> None:
+        self.tools.execute("list_files", {})
+        self.tools.execute("finish_task", {"summary": "第一项任务"})
+        self.assertIsNotNone(self.tools.completion_evidence)
+
+        self.tools.start_task()
+
+        self.assertIsNone(self.tools.completion_evidence)
+        result = json.loads(self.tools.execute("finish_task", {"summary": "第二项任务"}))
+        self.assertFalse(result["ok"])
+
     def test_direct_invalid_workspace_raises(self) -> None:
         with self.assertRaises(ToolError):
             WorkspaceTools(self.root / "missing")

@@ -18,6 +18,14 @@ from coding_agent.errors import ToolError
 
 
 _IGNORED_DIRECTORIES = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache"}
+_EVIDENCE_IGNORED_DIRECTORIES = _IGNORED_DIRECTORIES | {
+    ".coding-agent",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "node_modules",
+    "venv",
+}
 _PROTECTED_FILENAMES = {".env", "id_rsa", "id_ed25519", "credentials.json"}
 _DANGEROUS_COMMAND_PATTERNS = (
     r"(^|\s)rm\s+(-[^\s]*r[^\s]*f|-[^\s]*f[^\s]*r)\b",
@@ -312,6 +320,31 @@ class ToolSpec:
         return issues
 
 
+@dataclass(frozen=True, slots=True)
+class CompletionEvidence:
+    summary: str
+    changed_files: tuple[str, ...]
+    verification_command: str
+    limitations: str
+
+    def final_text(self) -> str:
+        lines = [self.summary]
+        if self.changed_files:
+            lines.extend(["", "修改文件：", *[f"- {path}" for path in self.changed_files]])
+        if self.verification_command:
+            lines.extend(["", f"验证命令：{self.verification_command}"])
+        if self.limitations.strip():
+            lines.extend(["", f"仍有限制：{self.limitations.strip()}"])
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True, slots=True)
+class _CommandEvidence:
+    command: str
+    exit_code: int
+    sequence: int
+
+
 class WorkspaceTools:
     """Tool registry whose file operations stay inside one workspace."""
 
@@ -336,6 +369,22 @@ class WorkspaceTools:
         for spec in specs:
             spec.validate_contract()
         self._specs = {spec.name: spec for spec in specs}
+        self.start_task()
+
+    @property
+    def completion_evidence(self) -> CompletionEvidence | None:
+        return self._completion_evidence
+
+    def start_task(self) -> None:
+        """Reset evidence so one CLI conversation turn cannot reuse another's proof."""
+
+        self._sequence = 0
+        self._successful_actions = 0
+        self._changed_files: set[str] = set()
+        self._last_mutation_sequence = 0
+        self._commands: list[_CommandEvidence] = []
+        self._completion_evidence: CompletionEvidence | None = None
+        self._last_snapshot = self._workspace_snapshot()
 
     def schemas(self) -> list[dict[str, Any]]:
         return [spec.schema() for spec in self._specs.values()]
@@ -412,6 +461,29 @@ class WorkspaceTools:
                 },
                 self.run_command,
             ),
+            ToolSpec(
+                "finish_task",
+                (
+                    "Submit the final result. Call this alone. After file changes, verification_command "
+                    "must exactly match a successful command run after the latest change."
+                ),
+                {
+                    "summary": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Concise description of the completed work.",
+                    },
+                    "verification_command": {
+                        "type": "string",
+                        "description": "Exact previously executed successful command; required after changes.",
+                    },
+                    "limitations": {
+                        "type": "string",
+                        "description": "Known remaining limitations; empty when none are known.",
+                    },
+                },
+                self.finish_task,
+            ),
         )
 
     def execute(self, name: str, arguments: Any) -> str:
@@ -430,21 +502,39 @@ class WorkspaceTools:
                 error="工具参数无效: " + "; ".join(issue["message"] for issue in issues),
                 details=issues,
             )
+        self._sequence += 1
+        sequence = self._sequence
+        mutation_capable = name in {"write_file", "replace_in_file", "run_command"}
+        before_snapshot = self._workspace_snapshot() if mutation_capable else None
         try:
             output = spec.handler(**arguments)
-            return self._result(True, output=self._truncate(output))
         except TypeError as exc:
+            self._capture_mutations(name, arguments, before_snapshot, sequence, False)
             return self._result(
                 False,
                 error_code="tool_internal_error",
                 error=f"工具内部调用失败: {exc}",
             )
         except (ToolError, OSError, ValueError, re.error) as exc:
+            self._capture_mutations(name, arguments, before_snapshot, sequence, False)
             return self._result(
                 False,
                 error_code="tool_execution_error",
                 error=str(exc),
             )
+        self._capture_mutations(name, arguments, before_snapshot, sequence, True)
+        if name == "run_command":
+            exit_code = self._command_exit_code(output)
+            self._commands.append(
+                _CommandEvidence(
+                    command=arguments["command"],
+                    exit_code=exit_code,
+                    sequence=sequence,
+                )
+            )
+        if name != "finish_task":
+            self._successful_actions += 1
+        return self._result(True, output=self._truncate(output))
 
     @staticmethod
     def _result(ok: bool, **payload: Any) -> str:
@@ -455,6 +545,124 @@ class WorkspaceTools:
             return text
         omitted = len(text) - self.output_limit
         return f"{text[:self.output_limit]}\n...[工具输出截断 {omitted} 个字符]"
+
+    def finish_task(
+        self,
+        summary: str,
+        verification_command: str = "",
+        limitations: str = "",
+    ) -> str:
+        """Accept completion only when local evidence supports the claim."""
+
+        current_snapshot = self._workspace_snapshot()
+        external_changes = self._snapshot_diff(self._last_snapshot, current_snapshot)
+        if external_changes:
+            self._record_mutations(external_changes, self._sequence)
+            self._last_snapshot = current_snapshot
+
+        if self._successful_actions == 0:
+            raise ToolError("完成门拒绝：尚无成功的本地工具操作，不能直接声明任务完成。")
+
+        verification_command = verification_command.strip()
+        successful_verifications = [
+            command
+            for command in self._commands
+            if command.command == verification_command and command.exit_code == 0
+        ]
+        if self._changed_files:
+            if not verification_command:
+                raise ToolError(
+                    "完成门拒绝：工作区已经修改，必须先运行验证命令，再原样提交 "
+                    "verification_command。"
+                )
+            if not successful_verifications:
+                raise ToolError(
+                    "完成门拒绝：没有找到与 verification_command 完全一致且退出码为 0 "
+                    "的真实命令记录。"
+                )
+            if successful_verifications[-1].sequence <= self._last_mutation_sequence:
+                raise ToolError(
+                    "完成门拒绝：该验证命令不晚于最近一次文件修改，请重新运行验证。"
+                )
+        elif verification_command and not successful_verifications:
+            raise ToolError(
+                "完成门拒绝：提交的 verification_command 没有成功执行记录。"
+            )
+
+        self._completion_evidence = CompletionEvidence(
+            summary=summary.strip(),
+            changed_files=tuple(sorted(self._changed_files)),
+            verification_command=verification_command,
+            limitations=limitations.strip(),
+        )
+        return "完成证据已接受。"
+
+    def _capture_mutations(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        before_snapshot: dict[str, tuple[int, int]] | None,
+        sequence: int,
+        succeeded: bool,
+    ) -> None:
+        if before_snapshot is None:
+            return
+        after_snapshot = self._workspace_snapshot()
+        changed_files = self._snapshot_diff(before_snapshot, after_snapshot)
+        if succeeded and name in {"write_file", "replace_in_file"}:
+            requested_path = arguments.get("path")
+            if isinstance(requested_path, str):
+                try:
+                    changed_files.add(self._relative(self._resolve(requested_path)))
+                except ToolError:
+                    pass
+        self._record_mutations(changed_files, sequence)
+        self._last_snapshot = after_snapshot
+
+    def _record_mutations(self, paths: set[str], sequence: int) -> None:
+        if not paths:
+            return
+        self._changed_files.update(paths)
+        self._last_mutation_sequence = max(self._last_mutation_sequence, sequence)
+
+    def _workspace_snapshot(self) -> dict[str, tuple[int, int]]:
+        snapshot: dict[str, tuple[int, int]] = {}
+        for current_directory, directories, filenames in os.walk(self.root):
+            directories[:] = [
+                name
+                for name in directories
+                if name not in _EVIDENCE_IGNORED_DIRECTORIES
+                and not Path(current_directory, name).is_symlink()
+            ]
+            for filename in filenames:
+                path = Path(current_directory, filename)
+                if path.is_symlink():
+                    continue
+                try:
+                    stat = path.stat()
+                    relative = path.relative_to(self.root).as_posix()
+                except (OSError, ValueError):
+                    continue
+                snapshot[relative] = (stat.st_size, stat.st_mtime_ns)
+        return snapshot
+
+    @staticmethod
+    def _snapshot_diff(
+        before: dict[str, tuple[int, int]],
+        after: dict[str, tuple[int, int]],
+    ) -> set[str]:
+        return {
+            path
+            for path in before.keys() | after.keys()
+            if before.get(path) != after.get(path)
+        }
+
+    @staticmethod
+    def _command_exit_code(output: str) -> int:
+        match = re.match(r"exit_code: (-?\d+)\n", output)
+        if match is None:
+            raise ToolError("run_command 返回结果缺少 exit_code。")
+        return int(match.group(1))
 
     def _resolve(self, requested_path: str, *, allow_missing: bool = False) -> Path:
         if not isinstance(requested_path, str) or not requested_path.strip():

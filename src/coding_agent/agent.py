@@ -57,6 +57,7 @@ class CodingAgent:
     ) -> RunResult:
         if not isinstance(task, str) or not task.strip():
             raise AgentError("任务描述不能为空。")
+        self._tools.start_task()
         conversation = Conversation(
             self._system_prompt(),
             task.strip(),
@@ -65,6 +66,7 @@ class CodingAgent:
         )
         previous_signature: str | None = None
         repeated_count = 0
+        rejected_completion_count = 0
 
         for iteration in range(1, self._max_iterations + 1):
             self._event_handler("iteration", {"number": iteration})
@@ -78,9 +80,43 @@ class CodingAgent:
             if not tool_calls:
                 if not content:
                     raise APIError("模型既没有返回文本，也没有返回工具调用。")
-                return RunResult(content, iteration, "completed")
+                rejected_completion_count += 1
+                if rejected_completion_count >= 3:
+                    raise AgentError(
+                        "模型连续 3 次绕过 finish_task 返回普通文本，已停止任务。"
+                    )
+                feedback = (
+                    "完成门拒绝这段普通回答。你必须使用 finish_task 单独提交结果；"
+                    "如果修改了文件，先运行验证命令，并把完全相同的命令填入 "
+                    "verification_command。"
+                )
+                self._event_handler(
+                    "completion_rejected",
+                    {"reason": feedback, "text": content},
+                )
+                conversation.add_completion_rejection(assistant, feedback)
+                continue
             if content:
                 self._event_handler("assistant", {"text": content})
+            rejected_completion_count = 0
+
+            parsed_calls = [self._parse_tool_call(call) for call in tool_calls]
+            finish_calls = [call for call in parsed_calls if call[1] == "finish_task"]
+            if finish_calls and len(parsed_calls) != 1:
+                result = json.dumps(
+                    {
+                        "ok": False,
+                        "error_code": "invalid_finish_batch",
+                        "error": "finish_task 必须是本轮唯一的工具调用，整批调用均未执行。",
+                    },
+                    ensure_ascii=False,
+                )
+                tool_messages = [
+                    {"role": "tool", "tool_call_id": call_id, "content": result}
+                    for call_id, _name, _arguments in parsed_calls
+                ]
+                conversation.add_tool_exchange(assistant, tool_messages)
+                continue
 
             signature = self._tool_call_signature(tool_calls)
             if signature == previous_signature:
@@ -94,8 +130,7 @@ class CodingAgent:
                 )
 
             tool_messages: list[dict[str, Any]] = []
-            for call in tool_calls:
-                call_id, name, arguments = self._parse_tool_call(call)
+            for call_id, name, arguments in parsed_calls:
                 self._event_handler("tool_start", {"name": name})
                 if isinstance(arguments, str):
                     try:
@@ -116,6 +151,9 @@ class CodingAgent:
                 tool_messages.append(
                     {"role": "tool", "tool_call_id": call_id, "content": result}
                 )
+            evidence = self._tools.completion_evidence
+            if evidence is not None:
+                return RunResult(evidence.final_text(), iteration, "verified_completed")
             conversation.add_tool_exchange(assistant, tool_messages)
 
         raise AgentError(f"达到最大循环次数 {self._max_iterations}，任务仍未结束。")
@@ -131,9 +169,13 @@ class CodingAgent:
 4. 工具失败时分析错误并调整参数，不要虚构成功结果。
 5. 不读取凭据，不尝试访问工作区之外的文件，不把秘密写入代码或日志。
 6. 避免破坏性命令。不得篡改 Git 元数据或声称进行了未实际执行的操作。
-7. 完成后停止调用工具，简要说明改动、验证结果和仍存在的限制。
+7. 不得用普通文本直接宣布完成。完成时必须单独调用 finish_task。
+8. 如果修改了文件，必须在最后一次修改之后运行相关测试或检查，并把完全相同的成功命令作为
+   verification_command 提交给 finish_task；不得虚构验证记录。
+9. finish_task 的 summary 说明改动，limitations 如实说明仍存在的限制。
 
-你可以连续调用多个工具。所有工具都在本机执行，不是远程托管的代码执行服务。"""
+除 finish_task 必须单独调用外，你可以在一轮中调用多个工具。所有工具都在本机执行，不是
+远程托管的代码执行服务。"""
 
     @staticmethod
     def _normalize_assistant_message(message: dict[str, Any]) -> dict[str, Any]:

@@ -50,6 +50,22 @@ class Conversation:
             raise ValueError("a tool exchange must contain tool_calls")
         self._blocks.append([deepcopy(assistant_message), *deepcopy(tool_messages)])
 
+    def add_completion_rejection(
+        self,
+        assistant_message: dict[str, Any],
+        feedback: str,
+    ) -> None:
+        """Keep an unverified answer and the local gate's corrective feedback."""
+
+        if assistant_message.get("role") != "assistant":
+            raise ValueError("assistant_message must have the assistant role")
+        self._blocks.append(
+            [
+                deepcopy(assistant_message),
+                {"role": "user", "content": feedback},
+            ]
+        )
+
     def messages_for_request(self) -> list[dict[str, Any]]:
         base_system = {"role": "system", "content": self._system_prompt}
         user = {"role": "user", "content": self._user_prompt}
@@ -184,6 +200,14 @@ class Conversation:
                 continue
             assistant = block[0]
             calls = assistant.get("tool_calls") or []
+            if not calls:
+                assistant_text = assistant.get("content", "")
+                feedback_text = block[1].get("content", "") if len(block) > 1 else ""
+                lines.append(
+                    f"- 未验证回答 {_clip(str(assistant_text), 180)}；"
+                    f"完成门反馈 {_clip(str(feedback_text), 240)}"
+                )
+                continue
             results = {
                 message.get("tool_call_id"): message.get("content", "")
                 for message in block[1:]
