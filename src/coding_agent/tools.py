@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import fnmatch
+import inspect
 import json
 import os
 import re
 import subprocess
 import tempfile
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, get_args, get_type_hints
 
 from coding_agent.errors import ToolError
 
@@ -26,6 +29,287 @@ _DANGEROUS_COMMAND_PATTERNS = (
     r"\bremove-item\b[^\r\n]*\b-recurse\b",
 )
 _SENSITIVE_ENV_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PRIVATE_KEY")
+_SUPPORTED_JSON_TYPES = {"string": str, "integer": int, "boolean": bool}
+_ALLOWED_PARAMETER_RULES = {
+    "type",
+    "description",
+    "minimum",
+    "maximum",
+    "minLength",
+    "maxLength",
+}
+
+
+def _json_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "boolean"
+    if type(value) is int:
+        return "integer"
+    if type(value) is float:
+        return "number"
+    if type(value) is str:
+        return "string"
+    if type(value) is list:
+        return "array"
+    if type(value) is dict:
+        return "object"
+    return type(value).__name__
+
+
+@dataclass(frozen=True, slots=True)
+class ToolSpec:
+    """Single source for a model-visible schema and its local handler."""
+
+    name: str
+    description: str
+    parameters: dict[str, dict[str, Any]]
+    handler: Callable[..., str]
+
+    def validate_contract(self) -> None:
+        """Fail fast when schema fields drift from the Python handler."""
+
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.name):
+            raise ToolError(f"工具名称无效: {self.name!r}")
+        if not self.description.strip():
+            raise ToolError(f"工具 {self.name} 缺少说明。")
+
+        signature = inspect.signature(self.handler)
+        handler_parameters = signature.parameters
+        unsupported_kinds = {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        }
+        unsupported = [
+            parameter.name
+            for parameter in handler_parameters.values()
+            if parameter.kind in unsupported_kinds
+        ]
+        if unsupported:
+            raise ToolError(
+                f"工具 {self.name} 的处理函数包含不支持的参数形式: {unsupported}"
+            )
+
+        schema_names = set(self.parameters)
+        handler_names = set(handler_parameters)
+        if schema_names != handler_names:
+            missing_schema = sorted(handler_names - schema_names)
+            missing_handler = sorted(schema_names - handler_names)
+            raise ToolError(
+                f"工具 {self.name} 的 Schema 与处理函数参数不一致；"
+                f"Schema 缺少 {missing_schema}，处理函数缺少 {missing_handler}。"
+            )
+
+        type_hints = get_type_hints(self.handler)
+        for parameter_name, rules in self.parameters.items():
+            if not isinstance(rules, dict):
+                raise ToolError(
+                    f"工具 {self.name} 参数 {parameter_name} 的 Schema 必须是对象。"
+                )
+            unknown_rules = sorted(set(rules) - _ALLOWED_PARAMETER_RULES)
+            if unknown_rules:
+                raise ToolError(
+                    f"工具 {self.name} 参数 {parameter_name} 包含不支持的 Schema 规则: "
+                    f"{unknown_rules}"
+                )
+            json_type = rules.get("type")
+            python_type = _SUPPORTED_JSON_TYPES.get(json_type)
+            if python_type is None:
+                raise ToolError(
+                    f"工具 {self.name} 参数 {parameter_name} 使用了不支持的类型: "
+                    f"{json_type!r}"
+                )
+            annotation = type_hints.get(parameter_name)
+            if annotation is None or not self._annotation_accepts(annotation, python_type):
+                raise ToolError(
+                    f"工具 {self.name} 参数 {parameter_name} 的 JSON 类型 {json_type} "
+                    "与处理函数类型标注不一致。"
+                )
+            self._validate_rule_bounds(parameter_name, rules, json_type)
+            default = handler_parameters[parameter_name].default
+            if default is not inspect.Parameter.empty and default is not None:
+                if type(default) is not python_type:
+                    raise ToolError(
+                        f"工具 {self.name} 参数 {parameter_name} 的默认值类型与 Schema 不一致。"
+                    )
+                default_issues = self._validate_value(parameter_name, default, rules)
+                if default_issues:
+                    raise ToolError(
+                        f"工具 {self.name} 参数 {parameter_name} 的默认值不符合 Schema: "
+                        f"{default_issues[0]['message']}"
+                    )
+
+    def schema(self) -> dict[str, Any]:
+        properties = deepcopy(self.parameters)
+        signature = inspect.signature(self.handler)
+        required: list[str] = []
+        for name, parameter in signature.parameters.items():
+            if parameter.default is inspect.Parameter.empty:
+                required.append(name)
+            elif parameter.default is not None:
+                properties[name].setdefault("default", parameter.default)
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def validate_arguments(self, arguments: Any) -> list[dict[str, Any]]:
+        """Validate the supported JSON Schema subset without coercing values."""
+
+        if not isinstance(arguments, dict):
+            return [
+                {
+                    "field": "$",
+                    "code": "type_mismatch",
+                    "expected": "object",
+                    "received": _json_type_name(arguments),
+                    "message": "工具参数必须是 JSON 对象。",
+                }
+            ]
+
+        issues: list[dict[str, Any]] = []
+        signature = inspect.signature(self.handler)
+        required = {
+            name
+            for name, parameter in signature.parameters.items()
+            if parameter.default is inspect.Parameter.empty
+        }
+        for name in sorted(required - set(arguments)):
+            issues.append(
+                {
+                    "field": name,
+                    "code": "required",
+                    "message": f"缺少必填参数 {name}。",
+                }
+            )
+
+        for name in arguments:
+            if not isinstance(name, str) or name not in self.parameters:
+                issues.append(
+                    {
+                        "field": str(name),
+                        "code": "additional_property",
+                        "message": f"不允许额外参数 {name!r}。",
+                    }
+                )
+
+        for name, rules in self.parameters.items():
+            if name not in arguments:
+                continue
+            value = arguments[name]
+            expected_name = rules["type"]
+            expected_type = _SUPPORTED_JSON_TYPES[expected_name]
+            if type(value) is not expected_type:
+                issues.append(
+                    {
+                        "field": name,
+                        "code": "type_mismatch",
+                        "expected": expected_name,
+                        "received": _json_type_name(value),
+                        "message": (
+                            f"参数 {name} 必须是 {expected_name}，"
+                            f"实际是 {_json_type_name(value)}。"
+                        ),
+                    }
+                )
+                continue
+            issues.extend(self._validate_value(name, value, rules))
+        return issues
+
+    @staticmethod
+    def _annotation_accepts(annotation: Any, expected: type[Any]) -> bool:
+        if annotation is expected or annotation is Any:
+            return True
+        return expected in get_args(annotation)
+
+    @staticmethod
+    def _validate_rule_bounds(
+        parameter_name: str,
+        rules: dict[str, Any],
+        json_type: str,
+    ) -> None:
+        if json_type == "integer":
+            minimum = rules.get("minimum")
+            maximum = rules.get("maximum")
+            for label, value in (("minimum", minimum), ("maximum", maximum)):
+                if value is not None and (type(value) is not int):
+                    raise ToolError(f"参数 {parameter_name} 的 {label} 必须是整数。")
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise ToolError(f"参数 {parameter_name} 的 minimum 不能大于 maximum。")
+        if json_type == "string":
+            minimum = rules.get("minLength")
+            maximum = rules.get("maxLength")
+            for label, value in (("minLength", minimum), ("maxLength", maximum)):
+                if value is not None and (type(value) is not int or value < 0):
+                    raise ToolError(f"参数 {parameter_name} 的 {label} 必须是非负整数。")
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise ToolError(f"参数 {parameter_name} 的 minLength 不能大于 maxLength。")
+
+    @staticmethod
+    def _validate_value(
+        name: str,
+        value: Any,
+        rules: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        if type(value) is int:
+            minimum = rules.get("minimum")
+            maximum = rules.get("maximum")
+            if minimum is not None and value < minimum:
+                issues.append(
+                    {
+                        "field": name,
+                        "code": "minimum",
+                        "expected": f">= {minimum}",
+                        "received": value,
+                        "message": f"参数 {name} 不能小于 {minimum}。",
+                    }
+                )
+            if maximum is not None and value > maximum:
+                issues.append(
+                    {
+                        "field": name,
+                        "code": "maximum",
+                        "expected": f"<= {maximum}",
+                        "received": value,
+                        "message": f"参数 {name} 不能大于 {maximum}。",
+                    }
+                )
+        if type(value) is str:
+            minimum = rules.get("minLength")
+            maximum = rules.get("maxLength")
+            if minimum is not None and len(value) < minimum:
+                issues.append(
+                    {
+                        "field": name,
+                        "code": "min_length",
+                        "expected": f"length >= {minimum}",
+                        "received": len(value),
+                        "message": f"参数 {name} 长度不能小于 {minimum}。",
+                    }
+                )
+            if maximum is not None and len(value) > maximum:
+                issues.append(
+                    {
+                        "field": name,
+                        "code": "max_length",
+                        "expected": f"length <= {maximum}",
+                        "received": len(value),
+                        "message": f"参数 {name} 长度不能大于 {maximum}。",
+                    }
+                )
+        return issues
 
 
 class WorkspaceTools:
@@ -44,114 +328,123 @@ class WorkspaceTools:
         self.root = resolved_root
         self.output_limit = output_limit
         self.command_timeout = command_timeout
-        self._handlers: dict[str, Callable[..., str]] = {
-            "list_files": self.list_files,
-            "read_file": self.read_file,
-            "write_file": self.write_file,
-            "replace_in_file": self.replace_in_file,
-            "search_text": self.search_text,
-            "run_command": self.run_command,
-        }
+        specs = self._build_specs()
+        names = [spec.name for spec in specs]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ToolError(f"工具名称重复: {duplicates}")
+        for spec in specs:
+            spec.validate_contract()
+        self._specs = {spec.name: spec for spec in specs}
 
     def schemas(self) -> list[dict[str, Any]]:
-        return [
-            self._schema(
+        return [spec.schema() for spec in self._specs.values()]
+
+    def _build_specs(self) -> tuple[ToolSpec, ...]:
+        return (
+            ToolSpec(
                 "list_files",
                 "List files in the workspace. Use this before guessing paths.",
                 {
-                    "path": {"type": "string", "description": "Workspace-relative directory; default is ."},
+                    "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Workspace-relative directory; default is .",
+                    },
                     "recursive": {"type": "boolean", "description": "Recurse into subdirectories"},
                     "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
                 },
+                self.list_files,
             ),
-            self._schema(
+            ToolSpec(
                 "read_file",
                 "Read a UTF-8 text file with line numbers.",
                 {
-                    "path": {"type": "string"},
-                    "start_line": {"type": "integer", "minimum": 1},
-                    "end_line": {"type": "integer", "minimum": 1},
+                    "path": {"type": "string", "minLength": 1},
+                    "start_line": {"type": "integer", "minimum": 1, "maximum": 10_000_000},
+                    "end_line": {"type": "integer", "minimum": 1, "maximum": 10_000_000},
                 },
-                required=["path"],
+                self.read_file,
             ),
-            self._schema(
+            ToolSpec(
                 "write_file",
                 "Create or fully overwrite a UTF-8 text file. Parent directories are created.",
                 {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
+                    "path": {"type": "string", "minLength": 1},
+                    "content": {"type": "string", "maxLength": 5_000_000},
                 },
-                required=["path", "content"],
+                self.write_file,
             ),
-            self._schema(
+            ToolSpec(
                 "replace_in_file",
                 "Replace exact text in a UTF-8 file; fails unless the occurrence count matches.",
                 {
-                    "path": {"type": "string"},
-                    "old": {"type": "string"},
+                    "path": {"type": "string", "minLength": 1},
+                    "old": {"type": "string", "minLength": 1},
                     "new": {"type": "string"},
                     "expected_occurrences": {"type": "integer", "minimum": 1, "maximum": 1000},
                 },
-                required=["path", "old", "new"],
+                self.replace_in_file,
             ),
-            self._schema(
+            ToolSpec(
                 "search_text",
                 "Search text files and return matching workspace-relative paths and line numbers.",
                 {
-                    "query": {"type": "string"},
-                    "path": {"type": "string"},
-                    "file_glob": {"type": "string", "description": "Example: *.py"},
+                    "query": {"type": "string", "minLength": 1},
+                    "path": {"type": "string", "minLength": 1},
+                    "file_glob": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Example: *.py",
+                    },
                     "case_sensitive": {"type": "boolean"},
                     "regex": {"type": "boolean"},
                     "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
                 },
-                required=["query"],
+                self.search_text,
             ),
-            self._schema(
+            ToolSpec(
                 "run_command",
                 "Run a non-interactive shell command in the workspace. Credentials are removed from its environment.",
                 {
-                    "command": {"type": "string"},
+                    "command": {"type": "string", "minLength": 1},
                     "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600},
                 },
-                required=["command"],
+                self.run_command,
             ),
-        ]
-
-    @staticmethod
-    def _schema(
-        name: str,
-        description: str,
-        properties: dict[str, Any],
-        required: list[str] | None = None,
-    ) -> dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required or [],
-                    "additionalProperties": False,
-                },
-            },
-        }
+        )
 
     def execute(self, name: str, arguments: Any) -> str:
-        handler = self._handlers.get(name)
-        if handler is None:
-            return self._result(False, error=f"未知工具: {name}")
-        if not isinstance(arguments, dict):
-            return self._result(False, error="工具参数必须是 JSON 对象。")
+        spec = self._specs.get(name) if isinstance(name, str) else None
+        if spec is None:
+            return self._result(
+                False,
+                error_code="unknown_tool",
+                error=f"未知工具: {name}",
+            )
+        issues = spec.validate_arguments(arguments)
+        if issues:
+            return self._result(
+                False,
+                error_code="invalid_tool_arguments",
+                error="工具参数无效: " + "; ".join(issue["message"] for issue in issues),
+                details=issues,
+            )
         try:
-            output = handler(**arguments)
+            output = spec.handler(**arguments)
             return self._result(True, output=self._truncate(output))
         except TypeError as exc:
-            return self._result(False, error=f"工具参数无效: {exc}")
+            return self._result(
+                False,
+                error_code="tool_internal_error",
+                error=f"工具内部调用失败: {exc}",
+            )
         except (ToolError, OSError, ValueError, re.error) as exc:
-            return self._result(False, error=str(exc))
+            return self._result(
+                False,
+                error_code="tool_execution_error",
+                error=str(exc),
+            )
 
     @staticmethod
     def _result(ok: bool, **payload: Any) -> str:
