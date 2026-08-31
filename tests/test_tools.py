@@ -118,6 +118,50 @@ class WorkspaceToolsTests(unittest.TestCase):
         result = json.loads(tools.execute("read_file", {"path": "long.txt"}))
         self.assertIn("截断", result["output"])
 
+    def test_inspect_code_returns_python_symbols_locations_and_variables(self) -> None:
+        source = '''"""Example module."""
+VALUE = 3
+
+class Counter:
+    """Count values."""
+    def __init__(self, start: int = 0) -> None:
+        self.value = start
+
+    def increment(self, amount: int) -> int:
+        """Increase the counter."""
+        result = self.value + amount
+        return result
+'''
+        (self.root / "example.py").write_text(source, encoding="utf-8")
+
+        result = json.loads(
+            self.tools.execute("inspect_code", {"path": "example.py"})
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("Python AST（精确结构）", result["output"])
+        self.assertIn("class Counter", result["output"])
+        self.assertIn("def increment(self, amount: int) -> int", result["output"])
+        self.assertIn("实例变量: self.value", result["output"])
+        self.assertIn("涉及变量: result", result["output"])
+        self.assertIn("L4-L12", result["output"])
+        self.assertNotIn("result = self.value + amount", result["output"])
+
+    def test_inspect_code_labels_non_python_outline_as_heuristic(self) -> None:
+        (self.root / "example.js").write_text(
+            "export function add(a, b) { return a + b; }\n",
+            encoding="utf-8",
+        )
+
+        result = json.loads(
+            self.tools.execute("inspect_code", {"path": "example.js"})
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("启发式", result["output"])
+        self.assertIn("L1: export function add", result["output"])
+        self.assertNotIn("return a + b", result["output"])
+
     def test_invalid_arguments_do_not_raise(self) -> None:
         result = json.loads(self.tools.execute("list_files", {"unexpected": True}))
         self.assertFalse(result["ok"])

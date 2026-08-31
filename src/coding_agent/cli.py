@@ -31,7 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-timeout", type=int, help="单次 API 请求超时秒数")
     parser.add_argument("--command-timeout", type=int, help="本地命令默认超时秒数")
     parser.add_argument("--max-iterations", type=int, help="最大模型循环次数")
-    parser.add_argument("--context-chars", type=int, help="发送给模型的近似上下文字符预算")
+    parser.add_argument(
+        "--context-chars",
+        type=int,
+        help="请求消息、工具 Schema 与回复预留的总字符预算",
+    )
     parser.add_argument("--tool-output-chars", type=int, help="单次工具输出字符上限")
     parser.add_argument(
         "--trace-dir",

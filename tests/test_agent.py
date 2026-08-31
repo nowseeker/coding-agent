@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from coding_agent.agent import CodingAgent
+from coding_agent.context import serialized_size
 from coding_agent.errors import AgentError, APIError
 from coding_agent.tools import WorkspaceTools
 
@@ -15,9 +16,11 @@ class FakeClient:
     def __init__(self, messages: list[dict[str, Any]]) -> None:
         self.responses = list(messages)
         self.requests: list[list[dict[str, Any]]] = []
+        self.tool_requests: list[list[dict[str, Any]]] = []
 
     def complete(self, messages, tools):
         self.requests.append(messages)
+        self.tool_requests.append(tools)
         return self.responses.pop(0)
 
 
@@ -293,6 +296,52 @@ class CodingAgentTests(unittest.TestCase):
 
             with self.assertRaisesRegex(AgentError, "绕过 finish_task"):
                 agent.run("执行任务")
+
+    def test_agent_accounts_for_tools_and_response_reserve(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(
+                [
+                    tool_call("inspect", "list_files", "{}"),
+                    finish_call("finish", "检查完成"),
+                ]
+            )
+            budget = 20_000
+            reserve = 1_500
+            agent = CodingAgent(
+                client,
+                WorkspaceTools(directory),
+                max_context_chars=budget,
+                response_reserve_chars=reserve,
+            )
+
+            agent.run("检查项目")
+
+            for messages, tools in zip(client.requests, client.tool_requests):
+                request = {
+                    "model": "",
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                }
+                self.assertLessEqual(serialized_size(request) + reserve + 256, budget)
+
+    def test_minimum_configured_budget_runs_a_small_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(
+                [
+                    tool_call("inspect", "list_files", "{}"),
+                    finish_call("finish", "检查完成"),
+                ]
+            )
+            agent = CodingAgent(
+                client,
+                WorkspaceTools(directory),
+                max_context_chars=8_000,
+            )
+
+            result = agent.run("检查空项目")
+
+            self.assertEqual(result.stop_reason, "verified_completed")
 
 
 if __name__ == "__main__":

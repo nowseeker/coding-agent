@@ -6,8 +6,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
-from coding_agent.context import Conversation
-from coding_agent.errors import AgentError, APIError
+from coding_agent.context import Conversation, serialized_size
+from coding_agent.errors import AgentError, APIError, ContextBudgetError
 from coding_agent.tools import WorkspaceTools
 
 
@@ -39,6 +39,7 @@ class CodingAgent:
         *,
         max_iterations: int = 24,
         max_context_chars: int = 120_000,
+        response_reserve_chars: int | None = None,
         repeated_call_limit: int = 3,
         event_handler: EventHandler | None = None,
     ) -> None:
@@ -46,6 +47,13 @@ class CodingAgent:
         self._tools = tools
         self._max_iterations = max_iterations
         self._max_context_chars = max_context_chars
+        self._response_reserve_chars = (
+            min(12_000, max(1_000, max_context_chars // 10))
+            if response_reserve_chars is None
+            else response_reserve_chars
+        )
+        if self._response_reserve_chars < 0:
+            raise ValueError("response_reserve_chars cannot be negative")
         self._repeated_call_limit = repeated_call_limit
         self._event_handler = event_handler or (lambda _kind, _payload: None)
 
@@ -67,12 +75,37 @@ class CodingAgent:
         previous_signature: str | None = None
         repeated_count = 0
         rejected_completion_count = 0
+        tool_schemas = self._tools.schemas()
+        request_shell = {
+            "model": "",
+            "messages": [],
+            "tools": tool_schemas,
+            "tool_choice": "auto",
+        }
+        fixed_request_chars = serialized_size(request_shell) + 256
+        reserved_chars = fixed_request_chars + self._response_reserve_chars
 
         for iteration in range(1, self._max_iterations + 1):
             self._event_handler("iteration", {"number": iteration})
+            messages = conversation.messages_for_request(reserved_chars=reserved_chars)
+            request_view = {
+                "model": "",
+                "messages": messages,
+                "tools": tool_schemas,
+                "tool_choice": "auto",
+            }
+            if (
+                serialized_size(request_view)
+                + self._response_reserve_chars
+                + 256
+                > self._max_context_chars
+            ):
+                raise ContextBudgetError(
+                    "内部预算检查失败：最终请求和回复预留超过 --context-chars，已停止发送。"
+                )
             message = self._client.complete(
-                conversation.messages_for_request(),
-                self._tools.schemas(),
+                messages,
+                tool_schemas,
             )
             assistant = self._normalize_assistant_message(message)
             content = self._text_content(assistant.get("content"))
@@ -164,8 +197,10 @@ class CodingAgent:
 
 工作规则：
 1. 先检查现有文件和约束，再制定并执行必要修改；不要猜测文件内容。
-2. 使用提供的本地工具读取、搜索、写入和测试代码。路径尽量使用工作区相对路径。
-3. 写文件前读取相关上下文；修改后运行与风险相称的测试或检查。
+2. 使用提供的本地工具读取、搜索、写入和测试代码。长文件先 inspect_code 获取符号、接口和
+   行号，再用 read_file 读取将要修改的精确范围。路径尽量使用工作区相对路径。
+3. 结构摘要只用于定位，不能代替真实代码。写文件前读取相关上下文；修改后运行与风险相称的
+   测试或检查。
 4. 工具失败时分析错误并调整参数，不要虚构成功结果。
 5. 不读取凭据，不尝试访问工作区之外的文件，不把秘密写入代码或日志。
 6. 避免破坏性命令。不得篡改 Git 元数据或声称进行了未实际执行的操作。

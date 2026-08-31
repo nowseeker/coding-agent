@@ -13,5 +13,9 @@ class APIError(AgentError):
     """Raised when the model endpoint cannot return a usable response."""
 
 
+class ContextBudgetError(AgentError):
+    """Raised when a protocol-safe request cannot fit the configured budget."""
+
+
 class ToolError(AgentError):
     """Raised when a local tool request is unsafe or cannot be completed."""

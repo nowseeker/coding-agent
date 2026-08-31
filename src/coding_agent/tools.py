@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, get_args, get_type_hints
 
+from coding_agent.code_outline import build_code_outline
 from coding_agent.errors import ToolError
 
 
@@ -416,6 +417,18 @@ class WorkspaceTools:
                 self.read_file,
             ),
             ToolSpec(
+                "inspect_code",
+                (
+                    "Return a compact local code outline with symbols, signatures, line ranges, "
+                    "documentation, and variables. Python uses AST; other languages are heuristic."
+                ),
+                {
+                    "path": {"type": "string", "minLength": 1},
+                    "max_symbols": {"type": "integer", "minimum": 1, "maximum": 1000},
+                },
+                self.inspect_code,
+            ),
+            ToolSpec(
                 "write_file",
                 "Create or fully overwrite a UTF-8 text file. Parent directories are created.",
                 {
@@ -742,6 +755,20 @@ class WorkspaceTools:
             f"{line_number}: {line}"
             for line_number, line in enumerate(selected, start=start_line)
         )
+
+    def inspect_code(self, path: str, max_symbols: int = 200) -> str:
+        """Describe code structure locally so the model can choose precise read ranges."""
+
+        file_path = self._resolve(path)
+        if not file_path.is_file():
+            raise ToolError(f"不是文件: {self._relative(file_path)}")
+        max_symbols = self._bounded_int(max_symbols, "max_symbols", 1, 1000)
+        if file_path.stat().st_size > 5_000_000:
+            raise ToolError("文件超过 5 MB；无法生成代码结构摘要。")
+        try:
+            return build_code_outline(file_path, self._relative(file_path), max_symbols)
+        except UnicodeDecodeError as exc:
+            raise ToolError("文件不是 UTF-8 文本，可能是二进制文件。") from exc
 
     def write_file(self, path: str, content: str) -> str:
         if not isinstance(content, str):
