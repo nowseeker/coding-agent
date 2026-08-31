@@ -12,6 +12,7 @@ from coding_agent.client import ChatCompletionsClient
 from coding_agent.config import Settings
 from coding_agent.errors import AgentError
 from coding_agent.tools import WorkspaceTools
+from coding_agent.trace import APITraceRecorder
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,8 +31,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-timeout", type=int, help="单次 API 请求超时秒数")
     parser.add_argument("--command-timeout", type=int, help="本地命令默认超时秒数")
     parser.add_argument("--max-iterations", type=int, help="最大模型循环次数")
-    parser.add_argument("--context-chars", type=int, help="发送给模型的近似上下文字符预算")
+    parser.add_argument(
+        "--context-chars",
+        type=int,
+        help="请求消息、工具 Schema 与回复预留的总字符预算",
+    )
     parser.add_argument("--tool-output-chars", type=int, help="单次工具输出字符上限")
+    parser.add_argument(
+        "--trace-dir",
+        help="API 输入输出审计目录（默认：仓库 .coding-agent/api-traces）",
+    )
     parser.add_argument("--quiet", action="store_true", help="只打印模型最终回答")
     parser.add_argument(
         "-i",
@@ -46,6 +55,10 @@ def _read_noninteractive_task(parts: list[str]) -> str:
     if parts:
         return " ".join(parts).strip()
     return sys.stdin.read().strip()
+
+
+def _default_trace_directory() -> Path:
+    return Path(__file__).resolve().parents[2] / ".coding-agent" / "api-traces"
 
 
 def _event_printer(quiet: bool):
@@ -148,8 +161,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_limit=settings.max_tool_output_chars,
             command_timeout=settings.command_timeout_seconds,
         )
+        trace_directory = (
+            Path(args.trace_dir).expanduser()
+            if args.trace_dir
+            else _default_trace_directory()
+        )
+        trace_recorder = APITraceRecorder(trace_directory, tools.root)
+        if not args.quiet:
+            print(f"API 输入输出记录：{trace_recorder.file_path}")
         agent = CodingAgent(
-            ChatCompletionsClient(settings),
+            ChatCompletionsClient(settings, trace_recorder),
             tools,
             max_iterations=settings.max_iterations,
             max_context_chars=settings.max_context_chars,

@@ -1,4 +1,4 @@
-"""Convenient source-tree launcher for the local web UI."""
+"""Convenient source-tree launcher for the native desktop UI."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from coding_agent.ui.server import main
+from coding_agent.ui.app import main
 
 
 if __name__ == "__main__":

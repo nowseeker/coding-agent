@@ -6,8 +6,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
-from coding_agent.context import Conversation
-from coding_agent.errors import AgentError, APIError
+from coding_agent.context import Conversation, serialized_size
+from coding_agent.errors import AgentError, APIError, ContextBudgetError
 from coding_agent.tools import WorkspaceTools
 
 
@@ -39,6 +39,7 @@ class CodingAgent:
         *,
         max_iterations: int = 24,
         max_context_chars: int = 120_000,
+        response_reserve_chars: int | None = None,
         repeated_call_limit: int = 3,
         event_handler: EventHandler | None = None,
     ) -> None:
@@ -46,6 +47,13 @@ class CodingAgent:
         self._tools = tools
         self._max_iterations = max_iterations
         self._max_context_chars = max_context_chars
+        self._response_reserve_chars = (
+            min(12_000, max(1_000, max_context_chars // 10))
+            if response_reserve_chars is None
+            else response_reserve_chars
+        )
+        if self._response_reserve_chars < 0:
+            raise ValueError("response_reserve_chars cannot be negative")
         self._repeated_call_limit = repeated_call_limit
         self._event_handler = event_handler or (lambda _kind, _payload: None)
 
@@ -57,6 +65,7 @@ class CodingAgent:
     ) -> RunResult:
         if not isinstance(task, str) or not task.strip():
             raise AgentError("任务描述不能为空。")
+        self._tools.start_task()
         conversation = Conversation(
             self._system_prompt(),
             task.strip(),
@@ -65,12 +74,38 @@ class CodingAgent:
         )
         previous_signature: str | None = None
         repeated_count = 0
+        rejected_completion_count = 0
+        tool_schemas = self._tools.schemas()
+        request_shell = {
+            "model": "",
+            "messages": [],
+            "tools": tool_schemas,
+            "tool_choice": "auto",
+        }
+        fixed_request_chars = serialized_size(request_shell) + 256
+        reserved_chars = fixed_request_chars + self._response_reserve_chars
 
         for iteration in range(1, self._max_iterations + 1):
             self._event_handler("iteration", {"number": iteration})
+            messages = conversation.messages_for_request(reserved_chars=reserved_chars)
+            request_view = {
+                "model": "",
+                "messages": messages,
+                "tools": tool_schemas,
+                "tool_choice": "auto",
+            }
+            if (
+                serialized_size(request_view)
+                + self._response_reserve_chars
+                + 256
+                > self._max_context_chars
+            ):
+                raise ContextBudgetError(
+                    "内部预算检查失败：最终请求和回复预留超过 --context-chars，已停止发送。"
+                )
             message = self._client.complete(
-                conversation.messages_for_request(),
-                self._tools.schemas(),
+                messages,
+                tool_schemas,
             )
             assistant = self._normalize_assistant_message(message)
             content = self._text_content(assistant.get("content"))
@@ -78,9 +113,43 @@ class CodingAgent:
             if not tool_calls:
                 if not content:
                     raise APIError("模型既没有返回文本，也没有返回工具调用。")
-                return RunResult(content, iteration, "completed")
+                rejected_completion_count += 1
+                if rejected_completion_count >= 3:
+                    raise AgentError(
+                        "模型连续 3 次绕过 finish_task 返回普通文本，已停止任务。"
+                    )
+                feedback = (
+                    "完成门拒绝这段普通回答。你必须使用 finish_task 单独提交结果；"
+                    "如果修改了文件，先运行验证命令，并把完全相同的命令填入 "
+                    "verification_command。"
+                )
+                self._event_handler(
+                    "completion_rejected",
+                    {"reason": feedback, "text": content},
+                )
+                conversation.add_completion_rejection(assistant, feedback)
+                continue
             if content:
                 self._event_handler("assistant", {"text": content})
+            rejected_completion_count = 0
+
+            parsed_calls = [self._parse_tool_call(call) for call in tool_calls]
+            finish_calls = [call for call in parsed_calls if call[1] == "finish_task"]
+            if finish_calls and len(parsed_calls) != 1:
+                result = json.dumps(
+                    {
+                        "ok": False,
+                        "error_code": "invalid_finish_batch",
+                        "error": "finish_task 必须是本轮唯一的工具调用，整批调用均未执行。",
+                    },
+                    ensure_ascii=False,
+                )
+                tool_messages = [
+                    {"role": "tool", "tool_call_id": call_id, "content": result}
+                    for call_id, _name, _arguments in parsed_calls
+                ]
+                conversation.add_tool_exchange(assistant, tool_messages)
+                continue
 
             signature = self._tool_call_signature(tool_calls)
             if signature == previous_signature:
@@ -94,12 +163,8 @@ class CodingAgent:
                 )
 
             tool_messages: list[dict[str, Any]] = []
-            for call in tool_calls:
-                call_id, name, arguments = self._parse_tool_call(call)
-                self._event_handler(
-                    "tool_start",
-                    {"name": name, "arguments": self._event_arguments(arguments)},
-                )
+            for call_id, name, arguments in parsed_calls:
+                self._event_handler("tool_start", {"name": name})
                 if isinstance(arguments, str):
                     try:
                         decoded_arguments = json.loads(arguments)
@@ -119,6 +184,9 @@ class CodingAgent:
                 tool_messages.append(
                     {"role": "tool", "tool_call_id": call_id, "content": result}
                 )
+            evidence = self._tools.completion_evidence
+            if evidence is not None:
+                return RunResult(evidence.final_text(), iteration, "verified_completed")
             conversation.add_tool_exchange(assistant, tool_messages)
 
         raise AgentError(f"达到最大循环次数 {self._max_iterations}，任务仍未结束。")
@@ -129,14 +197,20 @@ class CodingAgent:
 
 工作规则：
 1. 先检查现有文件和约束，再制定并执行必要修改；不要猜测文件内容。
-2. 使用提供的本地工具读取、搜索、写入和测试代码。路径尽量使用工作区相对路径。
-3. 写文件前读取相关上下文；修改后运行与风险相称的测试或检查。
+2. 使用提供的本地工具读取、搜索、写入和测试代码。长文件先 inspect_code 获取符号、接口和
+   行号，再用 read_file 读取将要修改的精确范围。路径尽量使用工作区相对路径。
+3. 结构摘要只用于定位，不能代替真实代码。写文件前读取相关上下文；修改后运行与风险相称的
+   测试或检查。
 4. 工具失败时分析错误并调整参数，不要虚构成功结果。
 5. 不读取凭据，不尝试访问工作区之外的文件，不把秘密写入代码或日志。
 6. 避免破坏性命令。不得篡改 Git 元数据或声称进行了未实际执行的操作。
-7. 完成后停止调用工具，简要说明改动、验证结果和仍存在的限制。
+7. 不得用普通文本直接宣布完成。完成时必须单独调用 finish_task。
+8. 如果修改了文件，必须在最后一次修改之后运行相关测试或检查，并把完全相同的成功命令作为
+   verification_command 提交给 finish_task；不得虚构验证记录。
+9. finish_task 的 summary 说明改动，limitations 如实说明仍存在的限制。
 
-你可以连续调用多个工具。所有工具都在本机执行，不是远程托管的代码执行服务。"""
+除 finish_task 必须单独调用外，你可以在一轮中调用多个工具。所有工具都在本机执行，不是
+远程托管的代码执行服务。"""
 
     @staticmethod
     def _normalize_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
@@ -206,25 +280,3 @@ class CodingAgent:
             return bool(json.loads(result).get("ok"))
         except (json.JSONDecodeError, AttributeError):
             return False
-
-    @staticmethod
-    def _event_arguments(arguments: Any) -> Any:
-        """Make tool arguments inspectable without duplicating full file contents."""
-
-        decoded = arguments
-        if isinstance(arguments, str):
-            try:
-                decoded = json.loads(arguments)
-            except json.JSONDecodeError:
-                return arguments[:1_000]
-        if not isinstance(decoded, dict):
-            return decoded
-        summary = dict(decoded)
-        content = summary.get("content")
-        if isinstance(content, str):
-            summary["content"] = f"[文件内容，共 {len(content)} 个字符]"
-        for key in ("old", "new"):
-            value = summary.get(key)
-            if isinstance(value, str) and len(value) > 500:
-                summary[key] = f"{value[:500]}\n...[事件参数截断 {len(value) - 500} 个字符]"
-        return summary

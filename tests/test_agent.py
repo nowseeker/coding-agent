@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from coding_agent.agent import CodingAgent
+from coding_agent.context import serialized_size
 from coding_agent.errors import AgentError, APIError
 from coding_agent.tools import WorkspaceTools
 
@@ -15,9 +16,11 @@ class FakeClient:
     def __init__(self, messages: list[dict[str, Any]]) -> None:
         self.responses = list(messages)
         self.requests: list[list[dict[str, Any]]] = []
+        self.tool_requests: list[list[dict[str, Any]]] = []
 
     def complete(self, messages, tools):
         self.requests.append(messages)
+        self.tool_requests.append(tools)
         return self.responses.pop(0)
 
 
@@ -35,21 +38,47 @@ def tool_call(call_id: str, name: str, arguments: str) -> dict[str, Any]:
     }
 
 
+def finish_call(
+    call_id: str,
+    summary: str,
+    verification_command: str = "",
+) -> dict[str, Any]:
+    return tool_call(
+        call_id,
+        "finish_task",
+        json.dumps(
+            {
+                "summary": summary,
+                "verification_command": verification_command,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+
 class CodingAgentTests(unittest.TestCase):
     def test_agent_executes_tool_then_returns_final_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            verification_command = "python --version"
             client = FakeClient(
                 [
                     tool_call("call_1", "write_file", '{"path":"hello.txt","content":"hi"}'),
-                    {"role": "assistant", "content": "任务完成。"},
+                    tool_call(
+                        "verify",
+                        "run_command",
+                        json.dumps({"command": verification_command}),
+                    ),
+                    finish_call("finish", "任务完成。", verification_command),
                 ]
             )
             agent = CodingAgent(client, WorkspaceTools(directory))
 
             result = agent.run("创建 hello.txt")
 
-            self.assertEqual(result.stop_reason, "completed")
-            self.assertEqual(result.iterations, 2)
+            self.assertEqual(result.stop_reason, "verified_completed")
+            self.assertEqual(result.iterations, 3)
+            self.assertIn("任务完成。", result.final_text)
+            self.assertIn(f"验证命令：{verification_command}", result.final_text)
             self.assertEqual(Path(directory, "hello.txt").read_text(encoding="utf-8"), "hi")
             tool_messages = [m for m in client.requests[1] if m["role"] == "tool"]
             self.assertEqual(tool_messages[0]["tool_call_id"], "call_1")
@@ -60,7 +89,8 @@ class CodingAgentTests(unittest.TestCase):
             client = FakeClient(
                 [
                     tool_call("bad", "read_file", "{"),
-                    {"role": "assistant", "content": "已处理参数错误。"},
+                    tool_call("inspect", "list_files", "{}"),
+                    finish_call("finish", "已处理参数错误。"),
                 ]
             )
             agent = CodingAgent(client, WorkspaceTools(directory))
@@ -92,7 +122,12 @@ class CodingAgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             events: list[tuple[str, dict[str, Any]]] = []
             agent = CodingAgent(
-                FakeClient([{"role": "assistant", "content": "最终回答"}]),
+                FakeClient(
+                    [
+                        tool_call("inspect", "list_files", "{}"),
+                        finish_call("finish", "最终回答"),
+                    ]
+                ),
                 WorkspaceTools(directory),
                 event_handler=lambda kind, payload: events.append((kind, payload)),
             )
@@ -135,7 +170,12 @@ class CodingAgentTests(unittest.TestCase):
 
     def test_completed_history_is_sent_before_current_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            client = FakeClient([{"role": "assistant", "content": "继续完成。"}])
+            client = FakeClient(
+                [
+                    tool_call("inspect", "list_files", "{}"),
+                    finish_call("finish", "继续完成。"),
+                ]
+            )
             agent = CodingAgent(client, WorkspaceTools(directory))
 
             agent.run(
@@ -156,29 +196,152 @@ class CodingAgentTests(unittest.TestCase):
                 ],
             )
 
-    def test_tool_event_redacts_full_write_content(self) -> None:
+    def test_plain_final_text_is_rejected_until_finish_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(
+                [
+                    {"role": "assistant", "content": "我认为已经完成。"},
+                    tool_call("inspect", "list_files", "{}"),
+                    finish_call("finish", "检查完成。"),
+                ]
+            )
             events: list[tuple[str, dict[str, Any]]] = []
             agent = CodingAgent(
-                FakeClient(
-                    [
-                        tool_call(
-                            "write",
-                            "write_file",
-                            '{"path":"large.txt","content":"generated code"}',
-                        ),
-                        {"role": "assistant", "content": "完成。"},
-                    ]
-                ),
+                client,
                 WorkspaceTools(directory),
                 event_handler=lambda kind, payload: events.append((kind, payload)),
             )
 
-            agent.run("写文件")
+            result = agent.run("检查项目")
 
-            start = next(payload for kind, payload in events if kind == "tool_start")
-            self.assertEqual(start["arguments"]["path"], "large.txt")
-            self.assertEqual(start["arguments"]["content"], "[文件内容，共 14 个字符]")
+            self.assertEqual(result.stop_reason, "verified_completed")
+            self.assertEqual(result.iterations, 3)
+            self.assertIn("completion_rejected", [kind for kind, _payload in events])
+            second_request = client.requests[1]
+            self.assertEqual(second_request[-2]["role"], "assistant")
+            self.assertEqual(second_request[-1]["role"], "user")
+            self.assertIn("必须使用 finish_task", second_request[-1]["content"])
+
+    def test_finish_task_rejection_is_returned_to_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            verification_command = "python --version"
+            client = FakeClient(
+                [
+                    tool_call("write", "write_file", '{"path":"a.txt","content":"a"}'),
+                    finish_call("too_early", "声称完成"),
+                    tool_call(
+                        "verify",
+                        "run_command",
+                        json.dumps({"command": verification_command}),
+                    ),
+                    finish_call("finish", "真实完成", verification_command),
+                ]
+            )
+            agent = CodingAgent(client, WorkspaceTools(directory))
+
+            result = agent.run("写文件")
+
+            self.assertEqual(result.iterations, 4)
+            rejected_result = next(
+                message
+                for message in client.requests[2]
+                if message.get("role") == "tool"
+                and message.get("tool_call_id") == "too_early"
+            )
+            self.assertFalse(json.loads(rejected_result["content"])["ok"])
+            self.assertIn("必须先运行验证命令", rejected_result["content"])
+
+    def test_finish_task_must_be_the_only_tool_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            invalid_batch = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    tool_call("inspect", "list_files", "{}")["tool_calls"][0],
+                    finish_call("finish_in_batch", "不能完成")["tool_calls"][0],
+                ],
+            }
+            client = FakeClient(
+                [
+                    invalid_batch,
+                    tool_call("inspect_again", "list_files", "{}"),
+                    finish_call("finish", "完成检查"),
+                ]
+            )
+            agent = CodingAgent(client, WorkspaceTools(directory))
+
+            result = agent.run("检查项目")
+
+            self.assertEqual(result.iterations, 3)
+            batch_results = [
+                json.loads(message["content"])
+                for message in client.requests[1]
+                if message.get("role") == "tool"
+            ]
+            self.assertEqual(len(batch_results), 2)
+            self.assertTrue(
+                all(result["error_code"] == "invalid_finish_batch" for result in batch_results)
+            )
+
+    def test_repeated_plain_completion_is_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(
+                [
+                    {"role": "assistant", "content": "完成 1"},
+                    {"role": "assistant", "content": "完成 2"},
+                    {"role": "assistant", "content": "完成 3"},
+                ]
+            )
+            agent = CodingAgent(client, WorkspaceTools(directory))
+
+            with self.assertRaisesRegex(AgentError, "绕过 finish_task"):
+                agent.run("执行任务")
+
+    def test_agent_accounts_for_tools_and_response_reserve(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(
+                [
+                    tool_call("inspect", "list_files", "{}"),
+                    finish_call("finish", "检查完成"),
+                ]
+            )
+            budget = 20_000
+            reserve = 1_500
+            agent = CodingAgent(
+                client,
+                WorkspaceTools(directory),
+                max_context_chars=budget,
+                response_reserve_chars=reserve,
+            )
+
+            agent.run("检查项目")
+
+            for messages, tools in zip(client.requests, client.tool_requests):
+                request = {
+                    "model": "",
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                }
+                self.assertLessEqual(serialized_size(request) + reserve + 256, budget)
+
+    def test_minimum_configured_budget_runs_a_small_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeClient(
+                [
+                    tool_call("inspect", "list_files", "{}"),
+                    finish_call("finish", "检查完成"),
+                ]
+            )
+            agent = CodingAgent(
+                client,
+                WorkspaceTools(directory),
+                max_context_chars=8_000,
+            )
+
+            result = agent.run("检查空项目")
+
+            self.assertEqual(result.stop_reason, "verified_completed")
 
 
 if __name__ == "__main__":
