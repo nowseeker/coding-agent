@@ -12,6 +12,7 @@ dependencies = []
 
 [project.scripts]
 coding-agent = "coding_agent.cli:main"
+coding-agent-ui = "coding_agent.ui.app:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -8,6 +8,7 @@ venv/
 goal/
 docs/
 tmp/
+workspaces/
 # Local state, including per-project API request/response traces.
 .coding-agent/
 .pytest_cache/
