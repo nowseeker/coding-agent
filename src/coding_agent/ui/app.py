@@ -86,6 +86,8 @@ class DesktopApp:
         sidebar.pack_propagate(False)
         main = ttk.Frame(outer, style="Panel.TFrame")
         main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(1, weight=1)
 
         ttk.Label(
             sidebar,
@@ -147,7 +149,7 @@ class DesktopApp:
         self.sidebar_status.pack(fill=tk.X, padx=16, pady=16)
 
         header = tk.Frame(main, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
-        header.pack(fill=tk.X)
+        header.grid(row=0, column=0, sticky="ew")
         self.project_title = tk.Label(
             header,
             text="请选择或创建项目",
@@ -168,9 +170,12 @@ class DesktopApp:
         self.project_path.pack(fill=tk.X, padx=20, pady=(0, 12))
 
         chat_frame = tk.Frame(main, bg=BACKGROUND)
-        chat_frame.pack(fill=tk.BOTH, expand=True, padx=18, pady=(16, 8))
+        chat_frame.grid(row=1, column=0, sticky="nsew", padx=18, pady=(16, 8))
+        chat_frame.columnconfigure(0, weight=1)
+        chat_frame.rowconfigure(0, weight=1)
         self.chat = tk.Text(
             chat_frame,
+            height=1,
             bg=BACKGROUND,
             fg=TEXT,
             insertbackground=TEXT,
@@ -186,8 +191,8 @@ class DesktopApp:
         )
         chat_scroll = ttk.Scrollbar(chat_frame, orient=tk.VERTICAL, command=self.chat.yview)
         self.chat.configure(yscrollcommand=chat_scroll.set)
-        self.chat.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        chat_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.chat.grid(row=0, column=0, sticky="nsew")
+        chat_scroll.grid(row=0, column=1, sticky="ns")
         self.chat.tag_configure("user_label", foreground=USER, font=("Segoe UI", 10, "bold"))
         self.chat.tag_configure(
             "assistant_label", foreground=ASSISTANT, font=("Segoe UI", 10, "bold")
@@ -198,7 +203,16 @@ class DesktopApp:
         self.chat.tag_configure("success", foreground=SUCCESS, lmargin1=18, lmargin2=18)
 
         composer = tk.Frame(main, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
-        composer.pack(fill=tk.X, padx=18, pady=(0, 18))
+        composer.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 18))
+        composer.columnconfigure(0, weight=1)
+        tk.Label(
+            composer,
+            text="输入任务",
+            bg=PANEL,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+            anchor=tk.W,
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(8, 0))
         self.input = tk.Text(
             composer,
             height=4,
@@ -211,7 +225,7 @@ class DesktopApp:
             pady=10,
             font=("Segoe UI", 10),
         )
-        self.input.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.input.grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
         self.input.bind("<Control-Return>", self._send_shortcut)
         self.send_button = ttk.Button(
             composer,
@@ -219,7 +233,7 @@ class DesktopApp:
             style="Accent.TButton",
             command=self._send_task,
         )
-        self.send_button.pack(side=tk.RIGHT, padx=10, pady=10)
+        self.send_button.grid(row=1, column=1, sticky="se", padx=10, pady=10)
 
     def refresh_projects(self, select_id: str | None = None) -> None:
         projects = self.store.list_projects()
